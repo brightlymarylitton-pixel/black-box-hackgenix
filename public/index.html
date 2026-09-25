@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Black Box: crash recovery you can prove</title>
+<style>
+:root{--paper:#edf0f3;--ink:#172033;--panel:#fff;--line:#cbd3dd;--ok:#0e7c66;--bad:#b3261e;--warn:#a86a00;--mute:#5b6778}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.45 "Segoe UI",system-ui,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:20px}
+h1{font-size:22px;margin:0}h2{font-size:16px;margin:0 0 8px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.sub{color:var(--mute);margin:2px 0 0}
+.seal{padding:14px 20px;border-radius:6px;color:#fff;font-weight:600;font-size:17px;background:var(--ok);min-width:340px}
+.seal small{display:block;font-weight:400;font-size:13px;opacity:.92}
+.seal.bad{background:var(--bad)}
+#down{display:none;background:var(--bad);color:#fff;padding:12px 16px;margin:14px 0 0;border-radius:6px;font-weight:600}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}
+button{font:inherit;padding:9px 14px;border:1px solid var(--ink);background:var(--panel);color:var(--ink);border-radius:5px;cursor:pointer}
+button:hover{background:var(--ink);color:#fff}button:focus-visible{outline:3px solid #2b6cb0;outline-offset:2px}
+button.crash{background:var(--bad);border-color:var(--bad);color:#fff}button.crash:hover{background:#7f1a15}
+.score{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0;border:1px solid var(--line);background:var(--panel);border-radius:6px;overflow:hidden}
+.score div{padding:12px 14px;border-right:1px solid var(--line)}.score div:last-child{border:0}
+.score b{display:block;font-size:24px}.score span{color:var(--mute);font-size:13px}
+.phases{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;margin-top:16px}
+.phase{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--ok);border-radius:6px;padding:12px 14px}
+.phase.during{border-top-color:var(--bad)}.phase.after{border-top-color:var(--ink)}
+.phase p{margin:0 0 8px;color:var(--mute);font-size:13px}
+.list{max-height:330px;overflow:auto}
+.ev{padding:6px 8px;border-left:3px solid var(--line);margin-bottom:4px;font-size:13.5px}
+.ev time,.ev code{color:var(--mute);font-size:12px}.ev code{font-family:Consolas,monospace}
+.ev.CRASH_DETECTED,.ev.ORDER_ROLLED_BACK{border-color:var(--bad);background:#fbeceb}
+.ev.RECOVERY_COMPLETE{border-color:var(--ok);background:#e7f4f0}.ev.DUPLICATE_BLOCKED{border-color:var(--warn);background:#fbf3e2}
+.ev.broken{outline:2px solid var(--bad);background:#fbeceb}
+.empty{color:var(--mute);font-style:italic;font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:6px}td,th{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line)}
+.st-completed{color:var(--ok)}.st-pending{color:var(--warn)}.st-rolled_back{color:var(--bad)}
+section.orders{margin-top:16px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px}
+</style></head><body><main>
+<div class="top"><div><h1>Black Box</h1><p class="sub">Crash the service. Get the full story back, with proof.</p></div>
+<div id="seal" class="seal">Checking history…</div></div>
+<div id="down">The service is down. The watchdog is restarting it…</div>
+<div class="actions">
+<button onclick="newOrder()">New order</button>
+<button onclick="spam()">Send the same order 5 times</button>
+<button class="crash" onclick="crash()">Crash now</button>
+<button onclick="tamper()">Edit an old log entry</button>
+<button onclick="reset()">Reset demo</button></div>
+<div class="score" id="score"></div>
+<div class="phases">
+<div class="phase"><h2>Before the crash</h2><p>Events recorded while everything was healthy</p><div class="list" id="before"></div></div>
+<div class="phase during"><h2>During the crash</h2><p>What was interrupted, and how recovery handled it</p><div class="list" id="during"></div></div>
+<div class="phase after"><h2>After recovery</h2><p>Life after the restart</p><div class="list" id="after"></div></div></div>
+<section class="orders"><h2>Orders (rebuilt from the log)</h2><table id="orders"></table></section>
+<script>
+const LABEL={BOOT:'Service started',SHUTDOWN:'Clean shutdown',ORDER_START:'Order started',ORDER_DONE:'Order completed',
+CRASH_DETECTED:'Crash detected',ORDER_ROLLED_BACK:'Order rolled back',RECOVERY_COMPLETE:'Recovery complete',DUPLICATE_BLOCKED:'Duplicate blocked'};
+const $=id=>document.getElementById(id);
+function detail(e){const d=e.data;
+ if(e.type==='ORDER_START')return `${d.id}: ${d.item}, ₹${d.amount}`;
+ if(e.type==='ORDER_DONE')return d.id;
+ if(e.type==='ORDER_ROLLED_BACK')return `${d.id}: ${d.reason}`;
+ if(e.type==='CRASH_DETECTED')return `last event was “${d.lastEvent}”, ${d.inflight.length} order(s) unfinished`+(d.tornWrite?', half-written line discarded':'');
+ if(e.type==='RECOVERY_COMPLETE')return `${d.rolledBack} order(s) rolled back in ${d.recoveryMs} ms`;
+ if(e.type==='DUPLICATE_BLOCKED')return `${d.orderId} already exists, no second charge`;
+ return d.firstRun?'first run':'';}
+function row(e,bad){return `<div class="ev ${e.type}${e.seq===bad?' broken':''}"><b>${LABEL[e.type]||e.type}</b> <time>#${e.seq} · ${new Date(e.ts).toLocaleTimeString()}</time><br>${detail(e)} <code>${e.hash.slice(0,10)}</code></div>`}
+function fill(id,list,bad,empty){$(id).innerHTML=list.length?list.map(e=>row(e,bad)).join(''):`<span class="empty">${empty}</span>`;const el=$(id);el.scrollTop=el.scrollHeight}
+async function refresh(){
+ let r;try{r=await(await fetch('/api/report')).json();$('down').style.display='none'}catch{$('down').style.display='block';return}
+ const v=r.verify,s=r.score,E=r.entries;
+ $('seal').className='seal'+(v.ok?'':' bad');
+ $('seal').innerHTML=v.ok?`History verified<small>${v.count} entries: complete, in order, untouched</small>`
+  :`History has been tampered with<small>Chain breaks at entry #${v.brokenAt}: ${v.reason}</small>`;
+ $('score').innerHTML=[[s.events,'events recorded'],[s.crashes,'crashes survived'],[0+(v.ok?0:1),'events lost or altered'],[s.rolledBack,'orders rolled back'],
+  [s.duplicatesBlocked,'duplicates blocked'],[s.lastRecoveryMs==null?'–':s.lastRecoveryMs+' ms','last recovery time']].map(([n,l])=>`<div><b>${n}</b><span>${l}</span></div>`).join('');
+ const c=E.map(e=>e.type).lastIndexOf('CRASH_DETECTED'),k=E.map(e=>e.type).lastIndexOf('RECOVERY_COMPLETE');
+ if(c<0){fill('before',E,v.brokenAt,'Nothing yet. Create an order.');fill('during',[],0,'No crash yet. Press “Crash now”.');fill('after',[],0,'Nothing to recover yet.')}
+ else{fill('before',E.slice(0,c),v.brokenAt,'No earlier events.');fill('during',E.slice(c,k+1),v.brokenAt,'');fill('after',E.slice(k+1),v.brokenAt,'Nothing since recovery.')}
+ $('orders').innerHTML='<tr><th>Order</th><th>Item</th><th>Amount</th><th>Status</th></tr>'+r.orders.map(o=>`<tr><td>${o.id}</td><td>${o.item}</td><td>₹${o.amount}</td><td class="st-${o.status}">${o.status.replace('_',' ')}</td></tr>`).join('')}
+const post=(u,b)=>fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}).then(r=>r.json()).catch(()=>({}));
+const items=['Vaccine kit','First-aid box','Water purifier','Medicine pack'];
+const newOrder=()=>post('/api/orders',{item:items[Math.floor(Math.random()*4)],amount:100+Math.floor(Math.random()*900),requestId:'req-'+Math.random()});
+function spam(){const id='req-'+Math.random();for(let i=0;i<5;i++)post('/api/orders',{item:'Vaccine kit',amount:450,requestId:id})}
+const crash=()=>post('/api/crash'),tamper=()=>post('/api/tamper'),reset=()=>post('/api/reset');
+setInterval(refresh,800);refresh();
+</script></main></body></html>
